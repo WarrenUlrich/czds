@@ -1,319 +1,288 @@
 #!/usr/bin/env python3
-# ICANN API for the Centralized Zones Data Service - developed by acidvegas (https://git.acid.vegas/czds)
+# ICANN API for the Centralized Zones Data Service
+# Developed by acidvegas (https://git.acid.vegas/czds)
 # czds/client.py
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
-import csv
-import io
 
 try:
     import aiohttp
 except ImportError:
-    raise ImportError('missing aiohttp library (pip install aiohttp)')
+    raise ImportError("missing aiohttp library (pip install aiohttp)")
 
 try:
     import aiofiles
 except ImportError:
-    raise ImportError('missing aiofiles library (pip install aiofiles)')
+    raise ImportError("missing aiofiles library (pip install aiofiles)")
 
 try:
     from tqdm import tqdm
 except ImportError:
-    raise ImportError('missing tqdm library (pip install tqdm)')
+    raise ImportError("missing tqdm library (pip install tqdm)")
 
-from .utils import gzip_decompress, humanize_bytes
+from .utils import humanize_bytes
 
 
-# Configure logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# ---------------------------------------------------------------------------
+# Logging configuration
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+
+
+# ---------------------------------------------------------------------------
+# CZDS Client
+# ---------------------------------------------------------------------------
 
 
 class CZDS:
-    '''Class for the ICANN Centralized Zones Data Service'''
+    """Client for the ICANN Centralized Zones Data Service (CZDS)."""
 
     def __init__(self, username: str, password: str):
-        '''
-        Initialize CZDS client
-        
-        :param username: ICANN Username
-        :param password: ICANN Password
-        '''
+        """
+        Initialize the CZDS client.
 
-        # Set the username and password
+        :param username: ICANN username
+        :param password: ICANN password
+        """
+
         self.username = username
         self.password = password
-
-        # Configure TCP keepalive
-        connector = aiohttp.TCPConnector(
-            keepalive_timeout=300,     # Keep connections alive for 5 minutes
-            force_close=False,         # Don't force close connections
-            enable_cleanup_closed=True, # Cleanup closed connections
-            ttl_dns_cache=300,         # Cache DNS results for 5 minutes
-        )
-
-        # Set the session with longer timeouts and keepalive
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=None, connect=60, sock_connect=60, sock_read=None),
-            headers={'Connection': 'keep-alive'},
-            raise_for_status=True
-        )
-
-        # Placeholder for the headers after authentication
         self.headers = None
 
-        logging.info('Initialized CZDS client')
+        connector = aiohttp.TCPConnector(
+            keepalive_timeout=300,
+            force_close=False,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+        )
 
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(
+                total=None, connect=60, sock_connect=60, sock_read=None
+            ),
+            headers={"Connection": "keep-alive"},
+            raise_for_status=True,
+        )
+
+        logging.info("Initialized CZDS client")
+
+    # ------------------------------------------------------------------
+    # Context manager helpers
+    # ------------------------------------------------------------------
 
     async def __aenter__(self):
-        '''Async context manager entry'''
-
-        # Authenticate with the ICANN API
         await self.authenticate()
-
         return self
 
-
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        '''Async context manager exit'''
-
-        # Close the client session
         await self.close()
 
-
     async def close(self):
-        '''Close the client session'''
-
-        # Close the client session if it exists
+        """Close the underlying HTTP session."""
         if self.session:
             await self.session.close()
-            logging.debug('Closed aiohttp session')
+            logging.debug("Closed aiohttp session")
 
+    # ------------------------------------------------------------------
+    # Authentication
+    # ------------------------------------------------------------------
 
     async def authenticate(self) -> str:
-        '''Authenticate with the ICANN API and return the access token'''
+        """Authenticate with ICANN and return the access token."""
 
-        # Set the data to be sent to the API
-        data = {'username': self.username, 'password': self.password}
+        logging.info("Authenticating with ICANN API...")
 
-        logging.info('Authenticating with ICANN API...')
+        payload = {"username": self.username, "password": self.password}
 
-        # Send the request to the API
-        async with self.session.post('https://account-api.icann.org/api/authenticate', json=data) as response:
-            if response.status != 200:
-                raise Exception(f'Authentication failed: {response.status} {await response.text()}')
+        async with self.session.post(
+            "https://account-api.icann.org/api/authenticate", json=payload
+        ) as response:
 
-            # Get the result from the API
             result = await response.json()
 
-            logging.info('Successfully authenticated with ICANN API')
+            self.headers = {"Authorization": f'Bearer {result["accessToken"]}'}
 
-            # Set the headers for the API requests
-            self.headers = {'Authorization': f'Bearer {result["accessToken"]}'}
+            logging.info("Successfully authenticated with ICANN API")
+            return result["accessToken"]
 
-            return result['accessToken']
-
+    # ------------------------------------------------------------------
+    # Metadata / reports
+    # ------------------------------------------------------------------
 
     async def fetch_zone_links(self) -> list:
-        '''Fetch the list of zone files available for download'''
+        """Fetch all available CZDS zone download URLs."""
 
-        logging.info('Fetching zone file links...')
+        logging.info("Fetching zone file links...")
 
-        # Send the request to the API
-        async with self.session.get('https://czds-api.icann.org/czds/downloads/links', headers=self.headers) as response:
-            if response.status != 200:
-                raise Exception(f'Failed to fetch zone links: {response.status} {await response.text()}')
+        async with self.session.get(
+            "https://czds-api.icann.org/czds/downloads/links", headers=self.headers
+        ) as response:
 
-            # Get the result from the API
             links = await response.json()
 
-            logging.info(f'Successfully fetched {len(links):,} zone links')
-
+            logging.info(f"Successfully fetched {len(links):,} zone links")
             return links
 
+    async def get_report(self, filepath: str = None, format: str = "csv") -> str | dict:
+        """
+        Download and scrub the zone request report.
 
-    async def get_report(self, filepath: str = None, format: str = 'csv') -> str | dict:
-        '''
-        Downloads the zone report stats from the API and scrubs the report for privacy
-        
-        :param filepath: Filepath to save the scrubbed report
-        :param format: Output format ('csv' or 'json')
-        '''
-        logging.info('Downloading zone stats report')
+        :param filepath: Optional output path
+        :param format: 'csv' or 'json'
+        """
 
-        # Send the request to the API
-        async with self.session.get('https://czds-api.icann.org/czds/requests/report', headers=self.headers) as response:
-            if response.status != 200:
-                raise Exception(f'Failed to download the zone stats report: {response.status} {await response.text()}')
+        logging.info("Downloading zone stats report")
 
-            # Get the content of the report
+        async with self.session.get(
+            "https://czds-api.icann.org/czds/requests/report", headers=self.headers
+        ) as response:
+
             content = await response.text()
 
-            # Scrub the username from the report
-            content = content.replace(self.username, 'nobody@no.name')
-            logging.debug('Scrubbed username from report')
+        # Scrub username
+        content = content.replace(self.username, "nobody@no.name")
 
-            # Convert the report to JSON format if requested
-            if format.lower() == 'json':
-                # Parse CSV content
-                csv_reader = csv.DictReader(io.StringIO(content))
-                
-                # Convert to list of dicts with formatted keys
-                json_data = []
-                for row in csv_reader:
-                    formatted_row = {
-                        key.lower().replace(' ', '_'): value 
-                        for key, value in row.items()
-                    }
-                    json_data.append(formatted_row)
-                
-                content = json.dumps(json_data, indent=4)
-                logging.debug('Converted report to JSON format')
+        if format.lower() == "json":
+            reader = csv.DictReader(io.StringIO(content))
+            content = json.dumps(
+                [
+                    {key.lower().replace(" ", "_"): value for key, value in row.items()}
+                    for row in reader
+                ],
+                indent=4,
+            )
 
-            # Save the report to a file if a filepath is provided
-            if filepath:
-                async with aiofiles.open(filepath, 'w') as file:
-                    await file.write(content)
-                logging.info(f'Saved report to {filepath}')
+        if filepath:
+            async with aiofiles.open(filepath, "w") as f:
+                await f.write(content)
+            logging.info(f"Saved report to {filepath}")
 
-            return content
+        return content
 
+    # ------------------------------------------------------------------
+    # Zone downloads
+    # ------------------------------------------------------------------
 
-    async def download_zone(self, url: str, output_directory: str, semaphore: asyncio.Semaphore):
-        '''
-        Download a single zone file
-        
-        :param url: URL to download
-        :param output_directory: Directory to save the zone file
-        :param semaphore: Optional semaphore for controlling concurrency
-        '''
-        
+    async def download_zone(
+        self, url: str, output_directory: str, semaphore: asyncio.Semaphore
+    ):
+        """
+        Download a single zone file (.gz preserved as-is).
+
+        :param url: Download URL
+        :param output_directory: Destination directory
+        :param semaphore: Concurrency limiter
+        """
+
         async def _download():
-            tld_name    = url.split('/')[-1].split('.')[0] # Extract TLD from URL
-            max_retries = 20                               # Maximum number of retries for failed downloads
-            retry_delay = 5                                # Delay between retries in seconds
-            
-            # Headers for better connection stability
-            download_headers = {
+            tld_name = url.split("/")[-1].split(".")[0]
+            max_retries = 20
+            retry_delay = 5
+
+            headers = {
                 **self.headers,
-                'Connection': 'keep-alive',
-                'Keep-Alive': 'timeout=600', # 10 minutes
-                'Accept-Encoding': 'gzip'
+                "Connection": "keep-alive",
+                "Keep-Alive": "timeout=600",
+                "Accept-Encoding": "gzip",
             }
 
-            # Start the attempt loop
             for attempt in range(max_retries):
                 try:
-                    logging.info(f'Starting download of {tld_name} zone file{" (attempt " + str(attempt + 1) + ")" if attempt > 0 else ""}')
+                    logging.info(
+                        f"Starting download of {tld_name}"
+                        + (f" (attempt {attempt + 1})" if attempt else "")
+                    )
 
-                    # Send the request to the API
-                    async with self.session.get(url, headers=download_headers) as response:
-                        # Check if the request was successful
-                        if response.status != 200:
-                            logging.error(f'Failed to download {tld_name}: {response.status} {await response.text()}')
+                    async with self.session.get(url, headers=headers) as response:
 
-                            # Retry the download if there are more attempts
-                            if attempt + 1 < max_retries:
-                                logging.info(f'Retrying {tld_name} in {retry_delay:,} seconds...')
-                                await asyncio.sleep(retry_delay)
-                                continue
+                        expected_size = int(response.headers.get("Content-Length", 0))
+                        content_disp = response.headers.get("Content-Disposition")
 
-                            raise Exception(f'Failed to download {tld_name}: {response.status} {await response.text()}')
+                        if not expected_size:
+                            raise ValueError("Missing Content-Length header")
 
-                        # Get expected file size from headers
-                        if not (expected_size := int(response.headers.get('Content-Length', 0))):
-                            raise ValueError(f'Missing Content-Length header for {tld_name}')
+                        if not content_disp:
+                            raise ValueError("Missing Content-Disposition header")
 
-                        # Check if the Content-Disposition header is present
-                        if not (content_disposition := response.headers.get('Content-Disposition')):
-                            raise ValueError(f'Missing Content-Disposition header for {tld_name}')
-
-                        # Extract the filename from the Content-Disposition header
-                        filename = content_disposition.split('filename=')[-1].strip('"')
-
-                        # Create the filepath
+                        filename = content_disp.split("filename=")[-1].strip('"')
                         filepath = os.path.join(output_directory, filename)
 
-                        # Create a progress bar to track the download
-                        with tqdm(total=expected_size, unit='B', unit_scale=True, desc=f'Downloading {tld_name}', leave=False) as pbar:
-                            # Open the file for writing
-                            async with aiofiles.open(filepath, 'wb') as file:
-                                # Initialize the total size for tracking
-                                total_size = 0
+                        total_size = 0
 
-                                # Write the chunk to the file
-                                try:
-                                    async for chunk in response.content.iter_chunked(8192):
-                                        await file.write(chunk)
-                                        total_size += len(chunk)
-                                        pbar.update(len(chunk))
-                                except Exception as e:
-                                    logging.error(f'Connection error while downloading {tld_name}: {str(e)}')
-                                    if attempt + 1 < max_retries:
-                                        logging.info(f'Retrying {tld_name} in {retry_delay} seconds...')
-                                        await asyncio.sleep(retry_delay)
-                                        continue
-                                    raise
+                        with tqdm(
+                            total=expected_size,
+                            unit="B",
+                            unit_scale=True,
+                            desc=f"Downloading {tld_name}",
+                            leave=False,
+                        ) as pbar:
 
-                        # Verify file size
-                        if expected_size and total_size != expected_size:
-                            error_msg = f'Incomplete download for {tld_name}: Got {humanize_bytes(total_size)}, expected {humanize_bytes(expected_size)}'
-                            logging.error(error_msg)
+                            async with aiofiles.open(filepath, "wb") as f:
+                                async for chunk in response.content.iter_chunked(8192):
+                                    await f.write(chunk)
+                                    total_size += len(chunk)
+                                    pbar.update(len(chunk))
+
+                        if total_size != expected_size:
                             os.remove(filepath)
-                            if attempt + 1 < max_retries:
-                                logging.info(f'Retrying {tld_name} in {retry_delay} seconds...')
-                                await asyncio.sleep(retry_delay)
-                                continue
-                            raise Exception(error_msg)
-                        
-                        logging.info(f'Successfully downloaded {tld_name} zone file ({humanize_bytes(total_size)})')
+                            raise IOError(
+                                f"Incomplete download: "
+                                f"{humanize_bytes(total_size)} / "
+                                f"{humanize_bytes(expected_size)}"
+                            )
 
-                        await gzip_decompress(filepath)
-                        filepath = filepath[:-3]
-                        logging.info(f'Decompressed {tld_name} zone file')
+                        logging.info(
+                            f"Successfully downloaded {tld_name} "
+                            f"({humanize_bytes(total_size)})"
+                        )
 
                         return filepath
 
                 except Exception as e:
                     if attempt + 1 >= max_retries:
-                        logging.error(f'Failed to download {tld_name} after {max_retries} attempts: {str(e)}')
-                        if 'filepath' in locals() and os.path.exists(filepath):
+                        logging.error(f"Failed to download {tld_name}: {e}")
+                        if "filepath" in locals() and os.path.exists(filepath):
                             os.remove(filepath)
                         raise
-                    logging.warning(f'Download attempt {attempt + 1} failed for {tld_name}: {str(e)}')
+
+                    logging.warning(
+                        f"Download attempt {attempt + 1} failed for " f"{tld_name}: {e}"
+                    )
                     await asyncio.sleep(retry_delay)
 
         async with semaphore:
             return await _download()
 
-
     async def download_zones(self, output_directory: str, concurrency: int):
-        '''
-        Download multiple zone files concurrently
-        
-        :param output_directory: Directory to save the zone files
-        :param concurrency: Number of concurrent downloads
-        '''
-        
-        # Create the output directory if it doesn't exist
-        os.makedirs(output_directory, exist_ok=True)
-        
-        # Get the zone links
-        zone_links = await self.fetch_zone_links()
-        zone_links.sort() # Sort the zone alphabetically for better tracking
+        """
+        Download all available zone files concurrently.
 
-        # Create a semaphore to limit the number of concurrent downloads
+        :param output_directory: Destination directory
+        :param concurrency: Max parallel downloads
+        """
+
+        os.makedirs(output_directory, exist_ok=True)
+
+        zone_links = await self.fetch_zone_links()
+        zone_links.sort()
+
         semaphore = asyncio.Semaphore(concurrency)
 
-        logging.info(f'Downloading {len(zone_links):,} zone files...')
+        logging.info(f"Downloading {len(zone_links):,} zone files...")
 
-        # Create a list of tasks to download the zone files
-        tasks = [self.download_zone(url, output_directory, semaphore) for url in zone_links]
+        tasks = [
+            self.download_zone(url, output_directory, semaphore) for url in zone_links
+        ]
 
-        # Run the tasks concurrently
         await asyncio.gather(*tasks)
 
-        logging.info(f'Completed downloading {len(zone_links):,} zone files')
+        logging.info(f"Completed downloading {len(zone_links):,} zone files")
