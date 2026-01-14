@@ -132,7 +132,7 @@ class CZDS:
             logging.info(f"Successfully fetched {len(links):,} zone links")
             return links
 
-    async def get_report(self, filepath: str = None, format: str = "csv") -> str | dict:
+    async def get_report(self, filepath: str = None, format: str = "csv"):
         """
         Download and scrub the zone request report.
 
